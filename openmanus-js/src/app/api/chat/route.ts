@@ -1,104 +1,130 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { GeminiAPI } from "@/lib/gemini/api";
 import { Config } from "@/lib/config";
-import { AgentMemory } from "@/lib/agent/memory";
+import { ToolAgent } from "@/lib/agent/tool-agent";
+import type { BaseAgent } from "@/lib/agent/base";
+import type { ProgressCallback } from "@/lib/agent/base";
 
-// シンプルなチャットAPIハンドラ
-export async function POST(req: NextRequest) {
-	try {
-		const { message, systemPrompt } = await req.json();
+// セッション管理 (簡易的なインメモリ実装)
+const agentSessions: Record<string, BaseAgent> = {};
 
-		// Gemini API キーを確認
-		const apiKey = process.env.GEMINI_API_KEY;
-		if (!apiKey) {
-			return NextResponse.json(
-				{ error: "Gemini API キーが設定されていません" },
-				{ status: 500 },
-			);
-		}
-
-		// 設定とGemini APIクライアントを初期化
+/**
+ * エージェントを取得または作成するヘルパー関数
+ * ストリーミング用に onProgress コールバックを受け取るように変更
+ */
+function getOrCreateAgent(
+	sessionId: string,
+	apiKey: string,
+	onProgress: ProgressCallback,
+): BaseAgent {
+	if (!agentSessions[sessionId]) {
+		console.log(`Creating new agent for session: ${sessionId}`);
 		const config = Config.getInstance({
 			llm: {
 				apiKey,
-				model: "gemini-2.0-flash",
-				temperature: 0.0,
-				maxOutputTokens: 4096,
+				// 環境変数からモデルを読み込む
+				model: process.env.LLM_MODEL || "gemini-2.0-flash",
+				temperature: Number.parseFloat(process.env.LLM_TEMPERATURE || "0.0"),
+				maxOutputTokens: Number.parseInt(
+					process.env.LLM_MAX_OUTPUT_TOKENS || "4096",
+				),
 			},
+			maxSteps: Number.parseInt(process.env.MAX_STEPS || "10"), // 最大ステップ数を設定
 		});
-
+		console.log(`Using LLM Model: ${config.llm.model}`);
 		const gemini = new GeminiAPI({
 			apiKey,
 			model: config.llm.model,
 			temperature: config.llm.temperature,
 			maxOutputTokens: config.llm.maxOutputTokens,
 		});
+		agentSessions[sessionId] = new ToolAgent(config, gemini, onProgress);
+	} else {
+		console.log(
+			`Agent for session ${sessionId} already exists. Updating callback.`,
+		);
+		// 既存のエージェントのコールバックを更新
+		(agentSessions[sessionId] as ToolAgent).updateProgressCallback(onProgress);
+	}
+	return agentSessions[sessionId];
+}
 
-		// メッセージをGeminiに送信
-		const response = await gemini.chat(message, systemPrompt);
+// エージェントベースのストリーミングチャットAPIハンドラ
+export async function POST(req: NextRequest) {
+	const { message, sessionId = "default" } = await req.json();
+	const apiKey = process.env.GEMINI_API_KEY;
 
-		// ユーザーメッセージとアシスタントレスポンスを作成
-		const userMessage = AgentMemory.userMessage(message);
-		const assistantMessage = AgentMemory.assistantMessage(response);
-
-		return NextResponse.json({
-			response,
-			messages: [userMessage, assistantMessage],
-		});
-	} catch (error) {
-		console.error("チャットAPI処理エラー:", error);
+	if (!apiKey) {
 		return NextResponse.json(
-			{
-				error: `リクエスト処理に失敗しました: ${error instanceof Error ? error.message : String(error)}`,
-			},
+			{ error: "Gemini API キーが設定されていません" },
 			{ status: 500 },
 		);
 	}
+
+	// ストリームを作成
+	const stream = new ReadableStream({
+		async start(controller) {
+			const encoder = new TextEncoder();
+
+			// 進捗通知コールバックを定義
+			const onProgress: ProgressCallback = (progress) => {
+				// 進捗情報をJSON文字列にしてストリームに書き込む
+				const chunk = `data: ${JSON.stringify(progress)}\n\n`;
+				controller.enqueue(encoder.encode(chunk));
+			};
+
+			try {
+				console.log("エージェント処理開始:", { message, sessionId });
+
+				// エージェントを取得または作成 (onProgress を渡す)
+				const agent = getOrCreateAgent(sessionId, apiKey, onProgress);
+
+				// エージェントを実行 (run は最終結果を待つ)
+				await agent.run(message);
+
+				console.log("エージェント処理完了");
+
+				// 実行完了後、ストリームを閉じる
+				controller.close();
+			} catch (error) {
+				console.error("エージェントストリーム処理エラー:", error);
+
+				// エラー詳細をJSONとしてシリアライズ
+				let errorDetails: string | Record<string, unknown>;
+				if (error instanceof Error) {
+					errorDetails = {
+						name: error.name,
+						message: error.message,
+						stack: error.stack,
+					};
+				} else {
+					errorDetails = String(error);
+				}
+
+				// エラー情報をクライアントに送信
+				const errorProgress = {
+					type: "error",
+					data: {
+						message: `エージェント実行中にエラー: ${error instanceof Error ? error.message : String(error)}`,
+						details: errorDetails,
+					},
+				};
+				const chunk = `data: ${JSON.stringify(errorProgress)}\n\n`;
+				controller.enqueue(encoder.encode(chunk));
+				controller.close(); // エラー発生時もストリームを閉じる
+			}
+		},
+	});
+
+	// ストリームをレスポンスとして返す (Content-Type を text/event-stream に設定)
+	return new Response(stream, {
+		headers: {
+			"Content-Type": "text/event-stream",
+			"Cache-Control": "no-cache",
+			Connection: "keep-alive",
+		},
+	});
 }
 
-// ストリーミングAPIハンドラ
-export async function GET(req: NextRequest) {
-	try {
-		const searchParams = new URL(req.url).searchParams;
-		const message = searchParams.get("message");
-		const systemPrompt = searchParams.get("systemPrompt");
-
-		if (!message) {
-			return NextResponse.json(
-				{ error: "メッセージパラメータが必要です" },
-				{ status: 400 },
-			);
-		}
-
-		// Gemini API キーを確認
-		const apiKey = process.env.GEMINI_API_KEY;
-		if (!apiKey) {
-			return NextResponse.json(
-				{ error: "Gemini API キーが設定されていません" },
-				{ status: 500 },
-			);
-		}
-
-		// Gemini APIクライアントを初期化
-		const gemini = new GeminiAPI({
-			apiKey,
-			model: "gemini-pro",
-			temperature: 0.0,
-			maxOutputTokens: 4096,
-		});
-
-		// ストリーミングレスポンスを取得
-		const stream = await gemini.streamChat(message, systemPrompt || undefined);
-
-		// ストリームをクライアントに返す
-		return new NextResponse(stream);
-	} catch (error) {
-		console.error("ストリーミングAPI処理エラー:", error);
-		return NextResponse.json(
-			{
-				error: `ストリーミングリクエスト処理に失敗しました: ${error instanceof Error ? error.message : String(error)}`,
-			},
-			{ status: 500 },
-		);
-	}
-}
+// 既存のGETハンドラは不要になるか、別の用途にする
+// export async function GET(req: NextRequest) { ... }

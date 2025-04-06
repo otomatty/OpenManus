@@ -8,19 +8,22 @@ interface ChatWindowProps {
 	messages: Message[];
 	onSendMessage: (message: string) => void;
 	isProcessing: boolean;
+	messagesEndRef?: React.RefObject<HTMLDivElement | null>;
 }
 
 export const ChatWindow: React.FC<ChatWindowProps> = ({
 	messages,
 	onSendMessage,
 	isProcessing,
+	messagesEndRef,
 }) => {
-	const messagesEndRef = useRef<HTMLDivElement>(null);
+	const internalMessagesEndRef = useRef<HTMLDivElement>(null);
+	const refToUse = messagesEndRef || internalMessagesEndRef;
 
 	// 新しいメッセージが来たら自動スクロール
 	useEffect(() => {
-		messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-	}, []);
+		refToUse.current?.scrollIntoView({ behavior: "smooth" });
+	}, [refToUse]);
 
 	return (
 		<div className="flex flex-col h-full">
@@ -42,7 +45,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
 								base64Image={message.base64_image}
 							/>
 						))}
-						<div ref={messagesEndRef} />
+						<div ref={refToUse} />
 					</div>
 				)}
 			</div>
